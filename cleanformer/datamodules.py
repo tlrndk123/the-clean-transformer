@@ -21,6 +21,7 @@ class CleanformerDataset(Dataset):
         self.Y = Y  # (N, L)
 
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        # batch가 무엇인지 볼수 있다.
         return self.X[index], self.Y[index]
 
     def __len__(self) -> int:
