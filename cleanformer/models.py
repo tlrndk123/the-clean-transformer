@@ -1,9 +1,25 @@
-from typing import Tuple, Dict
+from typing import Tuple
 import torch
 from pytorch_lightning import LightningModule
+from pytorch_lightning.utilities.types import EVAL_DATALOADERS, TRAIN_DATALOADERS
 from torch.nn import functional as F
 
+
 class Transformer(LightningModule):
+    # --- ignored --- #
+    def train_dataloader(self) -> TRAIN_DATALOADERS:
+        pass
+
+    def test_dataloader(self) -> EVAL_DATALOADERS:
+        pass
+
+    def val_dataloader(self) -> EVAL_DATALOADERS:
+        pass
+
+    def predict_dataloader(self) -> EVAL_DATALOADERS:
+        pass
+    # --- ignored --- #
+
     def __init__(self, hidden_size: int, ffn_size: int,
                  vocab_size: int, max_length: int,
                  pad_token_id: int, heads: int, depth: int,
@@ -14,7 +30,7 @@ class Transformer(LightningModule):
         # 학습을 해야하는 해야히는 레이어?: 임베딩 테이블, 인코더, 디코더, 이 3가지를 학습해야한다.
         # (|V|, H)
         self.token_embeddings = torch.nn.Embedding(num_embeddings=vocab_size, embedding_dim=hidden_size)
-        self.encoder = Encoder(hidden_size)
+        self.encoder = Encoder(hidden_size, heads)
         self.decoder = Decoder()
 
     def forward(self, src_ids: torch.LongTensor, tgt_ids: torch.Tensor,
@@ -94,29 +110,35 @@ class Transformer(LightningModule):
 
 class Encoder(torch.nn.Module):
 
-    def __init__(self, hidden_size: int):
+    def __init__(self, hidden_size: int, heads: int):
         super().__init__()
         # 최적화 해야할 가중치를 정의
-        self.self_attention_layer = AttentionLayer(hidden_size)
+        self.self_attention_layer = MultiHeadAttentionLayer(hidden_size,  heads)
         # TODO -  ffn
 
     def forward(self, x: torch.Tensor):
         """
         x: (N, L, H)
+        return contexts (맥락이 반영된 벡터)
         """
         # 단어가 쓰인 문장에서 단어가 가지는 맥락을 임베딩 벡터에 인코딩 해준다
         contexts = self.self_attention_layer.forward(q=x, k=x, v=x)
+        return contexts
 
 
 class Decoder(torch.nn.Module):
     pass
 
 
-class AttentionLayer(torch.nn.Module):
-    # TODO - multi head attention
+class MultiHeadAttentionLayer(torch.nn.Module):
 
-    def __init__(self, hidden_size: int):
+    def __init__(self, hidden_size: int, heads: int):
         super().__init__()
+        self.hidden_size = hidden_size
+        self.heads = heads  # 머리가 몇개?  symbol: h
+        # e.g. hidden_size = 24 head = 3
+        assert self.hidden_size % self.heads == 0  # 조건을 걸자
+        self.head_size = self.hidden_size // self.heads  # symbol: s
         self.linear_q = torch.nn.Linear(hidden_size, hidden_size)
         self.linear_k = torch.nn.Linear(hidden_size, hidden_size)
         self.linear_v = torch.nn.Linear(hidden_size, hidden_size)
@@ -129,22 +151,31 @@ class AttentionLayer(torch.nn.Module):
         v: (N, L, H)
         return contexts (N, L, H)
         """
+        N, L, _ = q.size()
         q = self.linear_q(q)  # (N, L, H) * (H, H) -> (N, L, H)
         k = self.linear_k(k)  # (N, L, H) * (H, H) -> (N, L, H)
         v = self.linear_v(v)  # (N, L, H) * (H, H) -> (N, L, H)
 
+        # ---  머리를 쪼개는 방식으로 멀티 헤드를 만들어야 한다 --- #
+        q = q.reshape(N, L, self.heads, self.head_size)   # (N, L, H) -> (N, L, heads, head_size)
+        k = k.reshape(N, L, self.heads, self.head_size)   # (N, L, H) -> (N, L, heads, head_size)
+        v = v.reshape(N, L, self.heads, self.head_size)   # (N, L, H) -> (N, L, heads, head_size)
+
         # TODO - "scaled"
 
         # "h" 차원에 대해서 벡터의 내적이 계산, 그렇게 h 차원은 reduce.
-        sims = torch.einsum("nlh,nlh->nll", q, k)  # (N, L, H) *  (N, L, H) -> (N, L, L)
+        # (N, L, heads, head_size) *  (N, L, heads, head_size) -> (N, heads, L, L)
+        sims = torch.einsum("nqhs,nkhs->nhqk", q, k)
 
         # TODO - masking (auto-regressive)
-
-        attentions = torch.softmax(sims, dim=2)  # (N, q의 길이 L, k의 갈이 L <- 마지막 차원을 정규화)
-
-        # "j"차원에 대하여 벡터의 내적이 계산, 그렇게 j 차원은 reduce.
-        contexts = torch.einsum("nij,njh->nih", attentions, v)  # (N, L, L) * (N, L, H) -> (N, L, H)
-
-        contexts = self.linear_o(contexts)  # (N, L, H) -> N, L, H)
+        # key 차원에 대해서 정규화를 했기
+        #  (N, heads, L, L)
+        attentions = torch.softmax(sims, dim=3)  # (N, q의 길이 L, k의 갈이 L <- 마지막 차원을 정규화)
+        # "k"차원에 있는 가중치 (확률분포로) 가중평균을 구해야한다
+        contexts = torch.einsum("nhqk,nkhs->nqhs", attentions, v)  # (N, L, L) * (N, L, H) -> (N, L, heads, head_size)
+        # concat
+        # (N, L, heads, head_size) -> (N, L, H = heads *head_size = heads * (H / heads))
+        contexts = contexts.reshape(N, L, self.hidden_size)
+        # 단순히 이어붙인 여러 의존관계를 join
+        contexts = self.linear_o(contexts)  # (N, L, H) -> (N, L, H)
         return contexts
-
